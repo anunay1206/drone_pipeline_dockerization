@@ -1,0 +1,73 @@
+# STAC Item (YAML) for a Tree-Crown pipeline run — analogous to the
+# admin-boundaries example, but with our fields and our result assets.
+# Same structure as the JSON STAC spec; YAML is just a friendlier rendering.
+
+type: Feature
+stac_version: "1.1.0"
+stac_extensions:
+  - https://stac-extensions.github.io/table/v1.2.0/schema.json
+id: sanjay_van_spot3_tree_species
+collection: tree_crown_runs
+
+# Footprint of the orthomosaic, in WGS84 (lon, lat) — taken from the GeoTIFF.
+geometry:
+  type: Polygon
+  coordinates:
+    - - [77.150, 28.530]
+      - [77.150, 28.545]
+      - [77.165, 28.545]
+      - [77.165, 28.530]
+      - [77.150, 28.530]
+bbox: [77.150, 28.530, 77.165, 28.545]
+
+properties:
+  title: Tree-Crown Species Map
+  description: >-
+    Per-crown tree-species map produced by the Tree-Crown pipeline: Detectree2
+    crown detection, DINOv2 feature extraction, KMeans clustering, and
+    human-assigned species labels. Polygons reprojected to WGS84.
+  datetime: "2026-06-03T12:00:00Z"
+  keywords: [forestry, tree-crown, species, drone, orthomosaic]
+
+  # Run parameters (our analogue of the demographic fields in the example).
+  project_id: 4e9bc983-2ee8-472d-8a87-b9b5f05a318b
+  detector_model: urban_cambridge            # model_key
+  feature_extractor: vit_base_patch14_dinov2.lvd142m   # params.model_name
+  source_epsg: 32643
+  chosen_k: 6
+
+  # Columns of crown_master.csv (table extension).
+  table:columns:
+    - { name: image_name, type: string, description: Crown image filename }
+    - { name: polygon_id, type: int64,  description: Crown polygon id }
+    - { name: site,       type: string, description: Orthomosaic stem }
+    - { name: cluster,    type: int64,  description: KMeans cluster id }
+    - { name: species,    type: string, description: Assigned species label }
+
+# The downloadable outputs (served from the per-project results folder).
+assets:
+  kmz:
+    href: "{static_base}/{project_id}/output/results/species_map.kmz"
+    type: application/vnd.google-earth.kmz
+    title: Species map for Google Earth
+    roles: [data]
+  crown_master:
+    href: "{static_base}/{project_id}/output/results/crown_master.csv"
+    type: text/csv
+    title: Per-crown master table
+    roles: [data]
+  polygon_species:
+    href: "{static_base}/{project_id}/output/results/polygon_species.csv"
+    type: text/csv
+    title: Polygon-to-species table
+    roles: [data]
+  thumbnail:
+    href: "{static_base}/{project_id}/output/detection/overlay.png"
+    type: image/png
+    title: Detection overlay
+    roles: [thumbnail]
+
+links:
+  - { rel: self,       href: "{static_base}/{project_id}/output/results/stac_item.json", type: application/json }
+  - { rel: collection, href: "{static_base}/collection.json", type: application/json, title: tree_crown_runs }
+  - { rel: root,       href: "{static_base}/catalog.json",    type: application/json, title: Tree-Crown Catalog }
