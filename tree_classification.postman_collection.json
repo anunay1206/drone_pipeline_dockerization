@@ -1,0 +1,500 @@
+{
+  "info": {
+    "_postman_id": "c4d5e6f7-3456-7890-bcde-f12345678901",
+    "name": "Tree-Crown Species Pipeline API",
+    "description": "Postman collection for the FastAPI service at app/main.py.\n\n**Run server:**  `uvicorn app.main:app --reload --port 8000`\n\n**Setup in Postman:**\n1. Import this collection and the companion environment file.\n2. Select 'Tree Classification - Local' in the top-right environment selector.\n3. If you set TCP_API_KEY in .env, fill the `api_key` env variable. Otherwise leave it blank — the collection sends the header but the server ignores it when no key is configured.\n\n**Suggested flow (full happy path):**\n  Health → Create project → Upload orthomosaic → Start analyze → Poll job → Clustering overview → Submit labels → Start finalize → Poll job → Get results → Download KMZ\n\nThe `project_id`, `job_id`, and `chosen_k` environment variables are filled by the test scripts attached to the relevant requests, so calls chain automatically when you run them in order.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key", "value": "X-API-Key", "type": "string" },
+      { "key": "value", "value": "{{api_key}}", "type": "string" },
+      { "key": "in", "value": "header", "type": "string" }
+    ]
+  },
+  "item": [
+    {
+      "name": "Meta",
+      "item": [
+        {
+          "name": "Health check",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/health",
+              "host": ["{{base_url}}"],
+              "path": ["health"]
+            },
+            "description": "Liveness probe. No auth required."
+          }
+        },
+        {
+          "name": "List models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/models",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "models"]
+            },
+            "description": "Show the registered Detectree2 .pth weight files, which is the default, and which are present on disk."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Projects",
+      "item": [
+        {
+          "name": "Create project",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Capture the new project_id into the environment for subsequent requests",
+                  "if (pm.response.code === 201) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.project_id) {",
+                  "        pm.environment.set('project_id', body.project_id);",
+                  "        console.log('Saved project_id =', body.project_id);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Sanjay Van S3\",\n  \"model_key\": \"urban_cambridge\",\n  \"source_epsg\": null,\n  \"params\": {\n    \"tile_size\": 10,\n    \"buffer\": 10,\n    \"iou_threshold\": 0.9,\n    \"conf_threshold\": 0.85,\n    \"k_list\": [2, 4, 6, 8, 10],\n    \"pca_components\": 50,\n    \"batch_size\": 16,\n    \"img_size\": 224,\n    \"model_name\": \"vit_base_patch14_dinov2.lvd142m\"\n  }\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects"]
+            },
+            "description": "Create a new project. Valid `model_key` values: urban_cambridge (default), paracou, randresize. `source_epsg` can be null — it's auto-detected from the GeoTIFF on upload.\n\nThe test script in this request saves the returned `project_id` into the environment so later requests can reference {{project_id}}."
+          }
+        },
+        {
+          "name": "List projects",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects"]
+            }
+          }
+        },
+        {
+          "name": "Get project",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}"]
+            },
+            "description": "Full project state, params, orthos, recommended_k, available_k, error message if any."
+          }
+        },
+        {
+          "name": "Delete project",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}"]
+            },
+            "description": "Deletes the DB row and the per-project storage directory. 204 No Content on success."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Uploads",
+      "item": [
+        {
+          "name": "Upload orthomosaic (.tif)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Pick a .tif or .tiff GeoTIFF. For the bundled sample use examples/S3C.tif. Call this endpoint repeatedly for a multi-ortho project."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/orthomosaic",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "orthomosaic"]
+            },
+            "description": "Streams the file to <storage>/<project_id>/input/ortho/. Returns the refreshed ProjectOut."
+          }
+        },
+        {
+          "name": "Upload ground-truth (.zip)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                {
+                  "key": "file",
+                  "type": "file",
+                  "src": [],
+                  "description": "Zip whose top-level folders are species names containing crown .tif files (the structure step3_validate expects). Optional — needed only if you want validation metrics."
+                }
+              ]
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/ground-truth",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "ground-truth"]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Analyze (Phase A)",
+      "item": [
+        {
+          "name": "Start analyze (detect + cluster)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.job_id) {",
+                  "        pm.environment.set('job_id', body.job_id);",
+                  "        console.log('Saved job_id =', body.job_id);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/analyze",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "analyze"]
+            },
+            "description": "Queues Job A (Detectree2 + DINOv2 features + multi-k clustering + t-SNE) on the `gpu` Celery queue. Requires the project to be in state UPLOADED, AWAITING_LABELS, or FAILED. On success the project transitions to ANALYZING.\n\nThe test script saves the returned `job_id` into the environment."
+          }
+        },
+        {
+          "name": "Poll job status",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/jobs/{{job_id}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "jobs", "{{job_id}}"]
+            },
+            "description": "Returns state (QUEUED | STARTED | SUCCEEDED | FAILED), current_stage, progress (0..1), the last 40 log lines, and any error. Repeat until state is SUCCEEDED or FAILED."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Clustering Review",
+      "item": [
+        {
+          "name": "Clustering overview",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    const k = body.recommended_k || (body.available_k && body.available_k[0]);",
+                  "    if (k) {",
+                  "        pm.environment.set('chosen_k', String(k));",
+                  "        console.log('Saved chosen_k =', k);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/clustering",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "clustering"]
+            },
+            "description": "Returns available_k, recommended_k, the k_recommendation_table (silhouette / DB / inertia per k), and URLs to the k-selection plot, per-k t-SNE plots, and per-cluster crown thumbnails. Project must be AWAITING_LABELS or later."
+          }
+        },
+        {
+          "name": "k-selection plot (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/clustering/k-selection.png",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "clustering", "k-selection.png"]
+            },
+            "description": "Elbow / silhouette / Davies-Bouldin curves across all k. Click 'Save Response → Save to a file' in Postman to download."
+          }
+        },
+        {
+          "name": "t-SNE for chosen_k (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/clustering/{{chosen_k}}/tsne.png",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "clustering", "{{chosen_k}}", "tsne.png"]
+            },
+            "description": "2-D t-SNE scatter colored by cluster id for k = {{chosen_k}}."
+          }
+        },
+        {
+          "name": "Clusters with sample crowns",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    const cluster = (body.clusters || []).find(c => c.sample_crowns && c.sample_crowns.length);",
+                  "    if (cluster) {",
+                  "        const url = cluster.sample_crowns[0];",
+                  "        const imageName = url.split('/').pop();",
+                  "        pm.environment.set('crown_image_name', imageName);",
+                  "        console.log('Saved crown_image_name =', imageName);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/clustering/{{chosen_k}}/clusters?samples=8",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "clustering", "{{chosen_k}}", "clusters"],
+              "query": [
+                { "key": "samples", "value": "8", "description": "How many sample crown URLs to include per cluster." }
+              ]
+            }
+          }
+        },
+        {
+          "name": "Crown image (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/crowns/{{crown_image_name}}",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "crowns", "{{crown_image_name}}"]
+            },
+            "description": "Render a single crown .tif as PNG. Set crown_image_name to a filename returned by the clusters endpoint."
+          }
+        },
+        {
+          "name": "Detection overlay (PNG)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/detection/overlay.png",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "detection", "overlay.png"],
+              "query": [
+                { "key": "stem", "value": "", "description": "With multiple orthos, pass the file stem to pick which overlay.", "disabled": true }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    {
+      "name": "Labels",
+      "item": [
+        {
+          "name": "Submit cluster -> species labels",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.chosen_k) {",
+                  "        pm.environment.set('chosen_k', body.chosen_k);",
+                  "        console.log('Saved chosen_k =', body.chosen_k);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "Content-Type", "value": "application/json" }
+            ],
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"chosen_k\": {{chosen_k}},\n  \"mapping\": [\n    { \"cluster\": 0, \"species\": \"acacia\",     \"notes\": \"\" },\n    { \"cluster\": 1, \"species\": \"non_acacia\", \"notes\": \"\" },\n    { \"cluster\": 2, \"species\": \"acacia\",     \"notes\": \"\" },\n    { \"cluster\": 3, \"species\": \"non_acacia\", \"notes\": \"\" },\n    { \"cluster\": 4, \"species\": \"acacia\",     \"notes\": \"\" },\n    { \"cluster\": 5, \"species\": \"non_acacia\", \"notes\": \"\" }\n  ]\n}"
+            },
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/labels",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "labels"]
+            },
+            "description": "Close the human-in-the-loop gate. chosen_k must be one of available_k. mapping must contain one entry per cluster (0..chosen_k-1). Project transitions to LABELS_SUBMITTED."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Finalize (Phase B)",
+      "item": [
+        {
+          "name": "Start finalize (assign + validate + export)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "if (pm.response.code === 200) {",
+                  "    const body = pm.response.json();",
+                  "    if (body.job_id) {",
+                  "        pm.environment.set('job_id', body.job_id);",
+                  "        console.log('Saved job_id =', body.job_id);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/finalize",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "finalize"]
+            },
+            "description": "Queues Job B on the cpu queue. Requires state LABELS_SUBMITTED, COMPLETED, or FAILED. Overwrites job_id env var so the Poll-job request works for Phase B too."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Results",
+      "item": [
+        {
+          "name": "Results summary",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/results",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "results"]
+            },
+            "description": "Species distribution counts, validation metrics, and download URLs for KMZ / crown_master.csv / polygon_species.csv / confusion_matrix.png."
+          }
+        },
+        {
+          "name": "Download KMZ",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/results/kmz",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "results", "kmz"]
+            },
+            "description": "Streams species_map.kmz. In Postman click Send -> Save Response -> Save to file."
+          }
+        },
+        {
+          "name": "Download crown_master.csv",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/results/crown-master.csv",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "results", "crown-master.csv"]
+            }
+          }
+        },
+        {
+          "name": "Download polygon_species.csv",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/results/polygon-species.csv",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "results", "polygon-species.csv"]
+            }
+          }
+        },
+        {
+          "name": "Download confusion_matrix.png",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{base_url}}/api/v1/projects/{{project_id}}/results/confusion-matrix.png",
+              "host": ["{{base_url}}"],
+              "path": ["api", "v1", "projects", "{{project_id}}", "results", "confusion-matrix.png"]
+            }
+          }
+        }
+      ]
+    }
+  ],
+  "variable": [
+    { "key": "base_url", "value": "http://localhost:8000" }
+  ]
+}

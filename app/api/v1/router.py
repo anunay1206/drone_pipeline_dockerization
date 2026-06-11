@@ -1,0 +1,11 @@
+from fastapi import APIRouter
+
+from app.api.v1 import analyze, clustering, finalize, labels, projects, results
+
+api_router = APIRouter(prefix="/api/v1")
+api_router.include_router(projects.router, tags=["projects"])
+api_router.include_router(analyze.router, tags=["analyze"])
+api_router.include_router(clustering.router, tags=["clustering"])
+api_router.include_router(labels.router, tags=["labels"])
+api_router.include_router(finalize.router, tags=["finalize"])
+api_router.include_router(results.router, tags=["results"])

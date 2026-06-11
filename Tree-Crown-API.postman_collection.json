@@ -1,0 +1,306 @@
+{
+  "info": {
+    "_postman_id": "8e0c8a4f-2c4a-4d1f-9a8e-treecrownapi01",
+    "name": "Tree-Crown Species Pipeline API",
+    "description": "Synchronous, two-DAG API for ortho → KMZ.\n\nDAG 1 (pre-label): create project → upload ortho(s) → (optional) upload ground truth → analyze (blocks until done) → review the two visuals + cluster thumbnails.\n\nDAG 2 (post-label, starts when the user uploads the filled species_map.csv): submit labels → finalize (blocks until done) → fetch results + download KMZ.\n\nThe collection captures `project_id` automatically after **DAG 1 > 1. Create project**, so the remaining requests just work. Override `baseUrl` and `k` (the chosen k) in the Variables tab as needed.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl",   "value": "http://localhost:8000", "type": "string" },
+    { "key": "projectId", "value": "",                      "type": "string" },
+    { "key": "k",         "value": "6",                     "type": "string" },
+    { "key": "modelKey",  "value": "urban_cambridge",       "type": "string" },
+    { "key": "apiKey",    "value": "",                      "type": "string", "description": "Set only if the server has TCP_API_KEY enabled" }
+  ],
+  "auth": {
+    "type": "apikey",
+    "apikey": [
+      { "key": "key",   "value": "X-API-Key", "type": "string" },
+      { "key": "value", "value": "{{apiKey}}", "type": "string" },
+      { "key": "in",    "value": "header",    "type": "string" }
+    ]
+  },
+  "item": [
+    {
+      "name": "DAG 1 — Pre-label",
+      "description": "Ortho upload through the two cluster-analysis visuals + summary. Each step's response provides what the next needs.",
+      "item": [
+        {
+          "name": "1. Create project",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Auto-capture project_id for the rest of the collection",
+                  "if (pm.response.code === 201) {",
+                  "    const data = pm.response.json();",
+                  "    if (data.project_id) {",
+                  "        pm.collectionVariables.set('projectId', data.project_id);",
+                  "        console.log('captured projectId:', data.project_id);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "Content-Type", "value": "application/json" }],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects"] },
+            "body": {
+              "mode": "raw",
+              "raw": "{\n  \"name\": \"Sanjay Van \\u2014 Spot 3\",\n  \"model_key\": \"{{modelKey}}\",\n  \"params\": {\n    \"tile_size\": 10,\n    \"buffer\": 10,\n    \"iou_threshold\": 0.9,\n    \"conf_threshold\": 0.85,\n    \"k_list\": [2, 4, 6, 8, 10],\n    \"pca_components\": 50,\n    \"batch_size\": 16,\n    \"img_size\": 224\n  }\n}"
+            },
+            "description": "Initialises a project. The model_key picks which Detectree2 weights run during detection. Response (201) returns the project_id, which is captured into the {{projectId}} collection variable by the test script."
+          }
+        },
+        {
+          "name": "2. Upload orthomosaic",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/orthomosaic", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "orthomosaic"] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "file", "type": "file", "src": [], "description": "Pick a .tif / .tiff GeoTIFF (e.g. ortho/s3_tree.tif). Call again for additional orthos." }
+              ]
+            },
+            "description": "Multipart upload of one orthomosaic. Stem of the filename becomes the ortho's stem in subsequent crown names. Call multiple times for a multi-ortho project."
+          }
+        },
+        {
+          "name": "3. Upload ground truth (optional)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/ground-truth", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "ground-truth"] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "file", "type": "file", "src": [], "description": "ZIP whose top-level folders are species names containing crown .tif files. Triggers Step 3 validation during finalize." }
+              ]
+            },
+            "description": "Optional. Skip if you have no pre-labelled crowns."
+          }
+        },
+        {
+          "name": "4. Analyze (synchronous — may take several minutes)",
+          "event": [
+            {
+              "listen": "test",
+              "script": {
+                "type": "text/javascript",
+                "exec": [
+                  "// Auto-capture the server's recommended k so requests 7-8 just work",
+                  "if (pm.response.code === 200) {",
+                  "    const data = pm.response.json();",
+                  "    if (data.recommended_k) {",
+                  "        pm.collectionVariables.set('k', String(data.recommended_k));",
+                  "        console.log('captured k =', data.recommended_k);",
+                  "    }",
+                  "}"
+                ]
+              }
+            }
+          ],
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/analyze", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "analyze"] },
+            "description": "Runs Step 0 (Detectree2 detection, once per ortho) → Step 1A-1E (crop, DINOv2 features, multi-k KMeans, k-selection metrics, t-SNE). **Blocks until done.** Increase the Postman request timeout (Settings → General → Request timeout in ms; set to 0 for unlimited) before calling for large orthos. On success the response is the full review payload (recommended_k, k_selection plot URL, per-k t-SNE plot URLs). The test script auto-captures `recommended_k` into the `{{k}}` collection variable so the t-SNE / clusters / labels requests chain cleanly."
+          }
+        },
+        {
+          "name": "5. Get review payload",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/clustering", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "clustering"] },
+            "description": "Returns recommended_k, the metric table, and URLs for both visuals + per-cluster thumbnails. Same payload as Analyze returns; this lets you re-fetch it later."
+          }
+        },
+        {
+          "name": "6. k-selection plot (DAG visual #2)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/clustering/k-selection.png", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "clustering", "k-selection.png"] },
+            "description": "PNG with elbow / silhouette / Davies-Bouldin curves across the candidate k values."
+          }
+        },
+        {
+          "name": "7. t-SNE scatter for chosen k (DAG visual #1)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/clustering/{{k}}/tsne.png", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "clustering", "{{k}}", "tsne.png"] },
+            "description": "PNG t-SNE scatter; dots coloured by KMeans cluster id at k={{k}}."
+          }
+        },
+        {
+          "name": "8. Cluster thumbnails for chosen k",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/clustering/{{k}}/clusters?samples=8",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "projects", "{{projectId}}", "clustering", "{{k}}", "clusters"],
+              "query": [{ "key": "samples", "value": "8" }]
+            },
+            "description": "Returns per-cluster crown counts + sample thumbnail URLs so you can decide what species each cluster is."
+          }
+        },
+        {
+          "name": "9. Fetch one crown as PNG",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/crowns/s3_tree_001.tif", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "crowns", "s3_tree_001.tif"] },
+            "description": "Renders the GeoTIFF crown as PNG. Crown filenames have the form {ortho-stem}_{id:03d}.tif (e.g. if you uploaded s3_tree.tif, crowns are named s3_tree_001.tif, s3_tree_002.tif, …). Replace the path segment with a real image_name from step 8's sample_crowns list."
+          }
+        },
+        {
+          "name": "10. Detection overlay",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": {
+              "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/detection/overlay.png",
+              "host": ["{{baseUrl}}"],
+              "path": ["api", "v1", "projects", "{{projectId}}", "detection", "overlay.png"],
+              "query": [{ "key": "stem", "value": "", "disabled": true, "description": "For multi-ortho projects, pass the ortho stem (e.g. s1_tree)" }]
+            },
+            "description": "Detected crowns drawn on the orthomosaic. For multi-ortho projects, enable the `stem` query parameter."
+          }
+        }
+      ]
+    },
+    {
+      "name": "DAG 2 — Post-label (starts with CSV upload)",
+      "description": "After you fill the species_map.csv (one row per cluster with the species column completed), this DAG runs assignment + optional validation + KMZ export.",
+      "item": [
+        {
+          "name": "1. Submit labels (CSV upload)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/labels", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "labels"] },
+            "body": {
+              "mode": "formdata",
+              "formdata": [
+                { "key": "chosen_k", "value": "{{k}}", "type": "text", "description": "Must be a value from available_k returned by analyze" },
+                { "key": "file", "type": "file", "src": [], "description": "Filled species_map.csv with columns: cluster, cluster_folder, species, notes" }
+              ]
+            },
+            "description": "Closes the human-in-the-loop gate. Uploads the filled species_map.csv. The server normalises species names (case, spaces, hyphens), persists the mapping, and writes the canonical k{chosen_k}_cluster_species_map.csv the pipeline reads."
+          }
+        },
+        {
+          "name": "2. Finalize (synchronous — minutes)",
+          "request": {
+            "method": "POST",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/finalize", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "finalize"] },
+            "description": "Runs Step 2 (assign species to every crown) → Step 3 (validate, only if ground truth was uploaded) → Step 4 (KMZ export). **Blocks until done.** Returns species_distribution, validation metrics (if any), and download URLs."
+          }
+        },
+        {
+          "name": "3. Get results",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/results", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "results"] },
+            "description": "Read-only summary plus the same download URLs as finalize returned. Useful for re-fetching later."
+          }
+        },
+        {
+          "name": "4. Download species_map.kmz",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/results/kmz", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "results", "kmz"] },
+            "description": "Final geospatial deliverable for Google Earth."
+          }
+        },
+        {
+          "name": "5. Download crown_master.csv",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/results/crown-master.csv", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "results", "crown-master.csv"] },
+            "description": "Per-crown CSV (image_name, polygon_id, site, cluster, species)."
+          }
+        },
+        {
+          "name": "6. Download polygon_species.csv",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/results/polygon-species.csv", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "results", "polygon-species.csv"] },
+            "description": "Compact polygon_id → species CSV for joining back to GIS layers."
+          }
+        },
+        {
+          "name": "7. Download confusion matrix (if ground truth supplied)",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}/results/confusion-matrix.png", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}", "results", "confusion-matrix.png"] },
+            "description": "Returned only when ground truth was uploaded before finalize."
+          }
+        }
+      ]
+    },
+    {
+      "name": "Auxiliary",
+      "item": [
+        {
+          "name": "List models",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/models", "host": ["{{baseUrl}}"], "path": ["api", "v1", "models"] },
+            "description": "Lists registered Detectree2 .pth weights with availability + which is the server default. Useful before creating a project."
+          }
+        },
+        {
+          "name": "Health",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/health", "host": ["{{baseUrl}}"], "path": ["health"] }
+          }
+        },
+        {
+          "name": "List projects",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects"] }
+          }
+        },
+        {
+          "name": "Get project",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}"] }
+          }
+        },
+        {
+          "name": "Delete project",
+          "request": {
+            "method": "DELETE",
+            "header": [],
+            "url": { "raw": "{{baseUrl}}/api/v1/projects/{{projectId}}", "host": ["{{baseUrl}}"], "path": ["api", "v1", "projects", "{{projectId}}"] },
+            "description": "Removes the project and every artifact under storage/projects/{project_id}/."
+          }
+        }
+      ]
+    }
+  ]
+}

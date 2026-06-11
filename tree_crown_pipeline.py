@@ -215,18 +215,30 @@ def step1_crop_crowns(config):
     return dir_crowns
 
 
-def step1_extract_features(config, dir_crowns):
+def build_dinov2(model_name, img_size):
+    """Build the DINOv2 feature-extraction model once; reused across orthos.
+
+    Separated from ``step1_extract_features`` so the worker can warm-cache it
+    per process (see app/workers/tasks.py:_get_dinov2).
+    """
+    model = timm.create_model(model_name, pretrained=True,
+                              num_classes=0, img_size=img_size)
+    model.eval().to(device)
+    return model
+
+
+def step1_extract_features(config, dir_crowns, model=None):
     """Extract DINOv2 features from crown images"""
     print('\n' + '='*70)
     print('STEP 1B: DINOV2 FEATURE EXTRACTION')
     print('='*70)
-    
+
     dir_features = os.path.join(config.STEP1_OUTPUT, 'features')
     make_dirs(dir_features)
-    
+
     feat_npy = os.path.join(dir_features, 'dinov2_features.npy')
     feat_csv = os.path.join(dir_features, 'dinov2_features.csv')
-    
+
     if os.path.exists(feat_npy):
         print('  Cached features found — loading.')
         features = np.load(feat_npy)
@@ -238,11 +250,10 @@ def step1_extract_features(config, dir_crowns):
             transforms.Normalize(mean=(0.485, 0.456, 0.406),
                                std=(0.229, 0.224, 0.225)),
         ])
-        
-        model = timm.create_model(config.MODEL_NAME, pretrained=True,
-                                num_classes=0, img_size=config.IMG_SIZE)
-        model.eval().to(device)
-        
+
+        if model is None:
+            model = build_dinov2(config.MODEL_NAME, config.IMG_SIZE)
+
         img_paths = sorted([os.path.join(dir_crowns, f)
                           for f in os.listdir(dir_crowns)
                           if f.lower().endswith('.tif')])
