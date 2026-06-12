@@ -9,6 +9,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.v1.router import api_router
+from app.core.errors import install_error_handlers
 from app.db.session import init_db
 
 
@@ -28,6 +29,9 @@ app = FastAPI(
     ),
     lifespan=lifespan,
 )
+
+# Normalise every error to the structured {"error": {...}} envelope (v4 §8).
+install_error_handlers(app)
 
 # CORS — open during development. `allow_origins=["*"]` cannot be combined with
 # `allow_credentials=True`; this API authenticates via the X-API-Key header (not

@@ -22,6 +22,14 @@ def _clustering_dir(project) -> str:
     return os.path.join(project_paths(project.id, _run(project))["step1_output"], "clustering")
 
 
+def _require_review(project) -> None:
+    """425 NOT_READY until clustering artifacts exist for this run (v4 §8.3)."""
+    if project.state not in _REVIEW_STATES:
+        raise HTTPException(425, {"code": "NOT_READY",
+            "message": f"Clustering not ready (state {project.state})",
+            "project_id": project.id})
+
+
 def build_clustering_payload(request: Request, project) -> dict:
     """Build the review payload (the two-DAG visuals + metrics).
 
@@ -57,25 +65,31 @@ def build_clustering_payload(request: Request, project) -> dict:
 def clustering_overview(request: Request, project=Depends(get_project)):
     """Review payload: recommended k, metric table, and URLs to the two DAGs."""
     if project.state not in _REVIEW_STATES:
-        raise HTTPException(409, f"Clustering not ready (state {project.state})")
+        raise HTTPException(409, {"code": "INVALID_STATE",
+            "message": f"Clustering not ready (state {project.state})",
+            "project_id": project.id})
     return build_clustering_payload(request, project)
 
 
 @router.get("/projects/{project_id}/clustering/k-selection.png")
 def k_selection_png(project=Depends(get_project)):
     """DAG #2 — elbow / silhouette / Davies-Bouldin across all k."""
+    _require_review(project)
     f = os.path.join(_clustering_dir(project), "k_selection.png")
     if not os.path.exists(f):
-        raise HTTPException(404, "k_selection.png not found")
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": "k_selection.png not found",
+            "project_id": project.id})
     return FileResponse(f, media_type="image/png")
 
 
 @router.get("/projects/{project_id}/clustering/{k}/tsne.png")
 def tsne_png(k: int, project=Depends(get_project)):
     """DAG #1 — t-SNE cluster scatter for a given k."""
+    _require_review(project)
     f = os.path.join(_clustering_dir(project), f"tsne_k{k}.png")
     if not os.path.exists(f):
-        raise HTTPException(404, "t-SNE plot not found")
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": "t-SNE plot not found",
+            "project_id": project.id})
     return FileResponse(f, media_type="image/png")
 
 
@@ -84,9 +98,11 @@ def clusters_overview(
     k: int, request: Request, project=Depends(get_project), samples: int = 8
 ):
     """Per-cluster sample crown thumbnails so the user can name each cluster."""
+    _require_review(project)
     kdir = os.path.join(_clustering_dir(project), f"k{k}")
     if not os.path.isdir(kdir):
-        raise HTTPException(404, f"clusters for k={k} not found")
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": f"clusters for k={k} not found",
+            "project_id": project.id})
 
     base = str(request.base_url).rstrip("/")
     pid = project.id
@@ -115,10 +131,12 @@ def crown_png(image_name: str, project=Depends(get_project)):
     safe = os.path.basename(image_name)
     src = os.path.join(project_paths(project.id, _run(project))["step1_output"], "crowns", safe)
     if not os.path.exists(src):
-        raise HTTPException(404, "crown not found")
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": "crown not found",
+            "project_id": project.id})
     png = _tif_to_png_bytes(src)
     if png is None:
-        raise HTTPException(503, "raster rendering unavailable (rasterio/PIL not installed)")
+        raise HTTPException(503, {"code": "DEPENDENCY_MISSING",
+            "message": "raster rendering unavailable (rasterio/PIL not installed)"})
     return StreamingResponse(png, media_type="image/png")
 
 
@@ -133,7 +151,8 @@ def overlay_png(project=Depends(get_project)):
     )
     f = os.path.join(det, subs[0], "overlay.png") if subs else ""
     if not f or not os.path.exists(f):
-        raise HTTPException(404, "overlay not found")
+        raise HTTPException(404, {"code": "NOT_FOUND", "message": "overlay not found",
+            "project_id": project.id})
     return FileResponse(f, media_type="image/png")
 
 

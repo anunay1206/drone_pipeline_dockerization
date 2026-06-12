@@ -47,8 +47,12 @@ class Settings(BaseSettings):
     max_upload_mb: int = 8192
 
     # ── auth (optional) ────────────────────────────────────────────────
-    # If set, clients must send the header ``X-API-Key: <api_key>``.
+    # If set, clients must send the header ``X-API-Key: <api_key>`` (frontend).
     api_key: str | None = None
+    # Separate service credential for the Compute API (/analyze, /finalize),
+    # shared only with the orchestrator. If set, those endpoints require the
+    # header ``X-Service-Token: <compute_token>`` (v4 §9.2).
+    compute_token: str | None = None
 
     # ── STAC ───────────────────────────────────────────────────────────
     # Public base URL used to make STAC Item asset/link hrefs absolute

@@ -1,6 +1,6 @@
-"""SQLAlchemy ORM models — the service's source of truth for state.
+"""SQLAlchemy ORM models - the service's source of truth for state.
 
-State machine (see API_DESIGN.md §4):
+State machine (see API_DESIGN.md section 4):
   CREATED -> UPLOADED -> ANALYZING -> AWAITING_LABELS
           -> LABELS_SUBMITTED -> FINALIZING -> COMPLETED
   (any heavy stage may go -> FAILED)
@@ -31,8 +31,10 @@ class Project(Base):
     recommended_k: Mapped[int | None] = mapped_column(Integer, nullable=True)
     available_k: Mapped[list | None] = mapped_column(JSON, nullable=True)
     # Run versioning: current_run points at the active work/run_<n> folder;
-    # `runs` keeps a lightweight history of prior runs (params + outcome).
+    # runs keeps a lightweight history of prior runs (params + outcome).
     current_run: Mapped[int] = mapped_column(Integer, default=1)
+    # User-facing display name for the current run (folders stay run_<n> on disk).
+    run_name: Mapped[str | None] = mapped_column(String, nullable=True)
     runs: Mapped[list | None] = mapped_column(JSON, default=list)
     error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
