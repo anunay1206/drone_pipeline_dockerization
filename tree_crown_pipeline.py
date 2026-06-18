@@ -215,18 +215,30 @@ def step1_crop_crowns(config):
     return dir_crowns
 
 
-def step1_extract_features(config, dir_crowns):
+def build_dinov2(model_name, img_size):
+    """Build the DINOv2 feature-extraction model once; reused across orthos.
+
+    Separated from ``step1_extract_features`` so the worker can warm-cache it
+    per process (see app/workers/tasks.py:_get_dinov2).
+    """
+    model = timm.create_model(model_name, pretrained=True,
+                              num_classes=0, img_size=img_size)
+    model.eval().to(device)
+    return model
+
+
+def step1_extract_features(config, dir_crowns, model=None):
     """Extract DINOv2 features from crown images"""
     print('\n' + '='*70)
     print('STEP 1B: DINOV2 FEATURE EXTRACTION')
     print('='*70)
-    
+
     dir_features = os.path.join(config.STEP1_OUTPUT, 'features')
     make_dirs(dir_features)
-    
+
     feat_npy = os.path.join(dir_features, 'dinov2_features.npy')
     feat_csv = os.path.join(dir_features, 'dinov2_features.csv')
-    
+
     if os.path.exists(feat_npy):
         print('  Cached features found — loading.')
         features = np.load(feat_npy)
@@ -238,11 +250,10 @@ def step1_extract_features(config, dir_crowns):
             transforms.Normalize(mean=(0.485, 0.456, 0.406),
                                std=(0.229, 0.224, 0.225)),
         ])
-        
-        model = timm.create_model(config.MODEL_NAME, pretrained=True,
-                                num_classes=0, img_size=config.IMG_SIZE)
-        model.eval().to(device)
-        
+
+        if model is None:
+            model = build_dinov2(config.MODEL_NAME, config.IMG_SIZE)
+
         img_paths = sorted([os.path.join(dir_crowns, f)
                           for f in os.listdir(dir_crowns)
                           if f.lower().endswith('.tif')])
@@ -280,8 +291,16 @@ def step1_extract_features(config, dir_crowns):
     
     # Standardize + optional PCA
     X = StandardScaler().fit_transform(features)
-    if config.PCA_COMPONENTS and config.PCA_COMPONENTS < X.shape[1]:
-        X = PCA(n_components=config.PCA_COMPONENTS, random_state=42).fit_transform(X)
+    # PCA can extract at most min(n_samples, n_features) components. Clamp the
+    # configured value so small crown counts (few samples) don't blow up.
+    n_samples, n_features = X.shape
+    max_components = min(n_samples, n_features)
+    n_components = min(config.PCA_COMPONENTS or 0, max_components)
+    if config.PCA_COMPONENTS and n_components >= 1 and n_components < n_features:
+        if n_components < config.PCA_COMPONENTS:
+            print(f'  PCA components clamped {config.PCA_COMPONENTS} → {n_components} '
+                  f'(only {n_samples} samples)')
+        X = PCA(n_components=n_components, random_state=42).fit_transform(X)
         print(f'  PCA applied → shape: {X.shape}')
     else:
         print(f'  PCA skipped — using raw standardized features')

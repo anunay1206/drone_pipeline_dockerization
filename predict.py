@@ -66,16 +66,43 @@ def resolve_ortho_path(ortho_path):
     return ortho_path
 
 
+# MODEL BUILDER (warm cache: build once, reuse across orthos)
+
+def build_predictor(model_path, conf_threshold=0.85):
+    """Build a detectron2 ``DefaultPredictor`` from detectree2 weights.
+
+    Separated from the pipeline so the worker can construct it once per
+    process and reuse it across every ortho (see app/workers/tasks.py).
+    """
+    cfg = setup_cfg(update_model=model_path)
+
+    if torch.backends.mps.is_available():
+        cfg.MODEL.DEVICE = "mps"
+    elif torch.cuda.is_available():
+        cfg.MODEL.DEVICE = "cuda"
+    else:
+        cfg.MODEL.DEVICE = "cpu"
+
+    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = conf_threshold
+    cfg.MODEL.ROI_HEADS.DETECTIONS_PER_IMAGE = 6
+
+    cfg.INPUT.MIN_SIZE_TEST = 512
+    cfg.INPUT.MAX_SIZE_TEST = 512
+
+    return DefaultPredictor(cfg)
+
+
 # MAIN PIPELINE
 
 def run_detectree2_pipeline(
     ortho_path,
-    model_path,
+    predictor=None,
     output_dir="output",
     tile_size=10,
     buffer=10,
     iou_threshold=0.9,
-    conf_threshold=0.85
+    conf_threshold=0.85,
+    model_path=None,
 ):
 
     os.makedirs(output_dir, exist_ok=True)
@@ -126,20 +153,13 @@ def run_detectree2_pipeline(
   # STEP 2: MODEL
 
     print("Step 2: Loading model...")
-    cfg = setup_cfg(update_model=model_path)
-
-    if torch.backends.mps.is_available():
-        cfg.MODEL.DEVICE = "mps"
-    else:
-        cfg.MODEL.DEVICE = "cpu"
-
-    cfg.MODEL.ROI_HEADS.SCORE_THRESH_TEST = conf_threshold
-    cfg.MODEL.ROI_HEADS.DETECTIONS_PER_IMAGE = 6
-
-    cfg.INPUT.MIN_SIZE_TEST = 512
-    cfg.INPUT.MAX_SIZE_TEST = 512
-
-    predictor = DefaultPredictor(cfg)
+    if predictor is None:
+        if model_path is None:
+            raise ValueError(
+                "run_detectree2_pipeline needs either a prebuilt `predictor` "
+                "or a `model_path` to build one."
+            )
+        predictor = build_predictor(model_path, conf_threshold=conf_threshold)
 
   
     # STEP 3: PREDICTION

@@ -1,0 +1,899 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Tree-Crown Species Pipeline</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    body { background: #f1f5f9; }
+    ::-webkit-scrollbar { height: 8px; width: 8px; }
+    ::-webkit-scrollbar-thumb { background: #cbd5e1; border-radius: 4px; }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+
+  <script type="text/babel" data-presets="react">
+const { useState, useEffect, useCallback, useRef } = React;
+
+// ──────────────────────────────────────────────────────────────────────────
+// Step definitions + state machine
+// ──────────────────────────────────────────────────────────────────────────
+const STEPS = [
+  { id: 0, label: "Create project" },
+  { id: 1, label: "Upload orthomosaic" },
+  { id: 2, label: "Analyze" },
+  { id: 3, label: "Review clusters" },
+  { id: 4, label: "Label species" },
+  { id: 5, label: "Finalize & results" },
+];
+
+const REVIEW_STATES = ["AWAITING_LABELS", "LABELS_SUBMITTED", "FINALIZING", "COMPLETED"];
+const FINAL_STATES = ["LABELS_SUBMITTED", "FINALIZING", "COMPLETED"];
+
+// ──────────────────────────────────────────────────────────────────────────
+// Helpers
+// ──────────────────────────────────────────────────────────────────────────
+function classNames(...xs) { return xs.filter(Boolean).join(" "); }
+
+function csvCell(v) {
+  const s = String(v ?? "");
+  return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+function buildLabelsCsv(k, labels) {
+  const lines = ["cluster,species,notes"];
+  for (let i = 0; i < k; i++) {
+    const l = labels[i] || {};
+    lines.push([i, csvCell(l.species || ""), csvCell(l.notes || "")].join(","));
+  }
+  return lines.join("\n");
+}
+
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+// Poll GET /projects/{id} until state hits a done or fail target. The trigger
+// endpoints return immediately; the project state machine is the source of truth.
+// Bails out (rather than spinning forever) on a total timeout or after several
+// consecutive request failures, so a hung run or wrong Base URL surfaces as an error.
+async function pollProjectState(api, pid, doneStates, failStates, onState, opts = {}) {
+  const intervalMs = opts.intervalMs ?? 4000;
+  const timeoutMs = opts.timeoutMs ?? 30 * 60 * 1000;   // 30 min
+  const maxErrors = opts.maxErrors ?? 5;
+  const start = Date.now();
+  let errors = 0;
+  while (true) {
+    await sleep(intervalMs);
+    let p;
+    try { p = await api(`/api/v1/projects/${pid}`); errors = 0; }
+    catch (e) {
+      if (++errors >= maxErrors) throw new Error(`Lost contact with the server while polling: ${e.message}`);
+      continue;  // transient hiccup — keep polling
+    }
+    if (onState) onState(p.state);
+    if (doneStates.includes(p.state)) return p;
+    if (failStates.includes(p.state)) throw new Error(p.error || `Run failed (state ${p.state})`);
+    if (Date.now() - start > timeoutMs) {
+      throw new Error(`Timed out after ${Math.round(timeoutMs / 60000)} min waiting for ${doneStates.join("/")} (last state: ${p.state}).`);
+    }
+  }
+}
+
+// Concurrency guard: refuse to start a new run while one is already in progress
+// for this project (prevents overlapping analyze/finalize on the same project_id).
+async function assertNotBusy(api, pid) {
+  const p = await api(`/api/v1/projects/${pid}`);
+  if (p.state === "ANALYZING" || p.state === "FINALIZING") {
+    throw new Error(`A run is already in progress (state: ${p.state}). Wait for it to finish before starting another.`);
+  }
+  return p;
+}
+
+// ──────────────────────────────────────────────────────────────────────────
+// Auth-aware image: <img> for open APIs, blob-fetch when an API key is set.
+// Falls back to an "open in new tab" link if the asset fails to load.
+// ──────────────────────────────────────────────────────────────────────────
+function AuthImage({ src, baseUrl, apiKey, className, alt }) {
+  const [objUrl, setObjUrl] = useState(null);
+  const [err, setErr] = useState(false);
+  const full = src ? (src.startsWith("http") ? src : baseUrl + src) : null;
+
+  useEffect(() => {
+    setErr(false);
+    setObjUrl(null);
+    if (!full || !apiKey) return;
+    let cancelled = false, made = null;
+    fetch(full, { headers: { "X-API-Key": apiKey } })
+      .then((r) => { if (!r.ok) throw new Error(); return r.blob(); })
+      .then((b) => { if (cancelled) return; made = URL.createObjectURL(b); setObjUrl(made); })
+      .catch(() => setErr(true));
+    return () => { cancelled = true; if (made) URL.revokeObjectURL(made); };
+  }, [full, apiKey]);
+
+  if (!full) return null;
+  const finalSrc = apiKey ? objUrl : full;
+  return (
+    <div className="flex flex-col gap-1">
+      {!err ? (
+        <img
+          src={finalSrc || undefined}
+          alt={alt || ""}
+          className={className}
+          onError={() => setErr(true)}
+        />
+      ) : (
+        <div className={classNames(className, "flex items-center justify-center bg-slate-100 text-slate-400 text-xs p-4 rounded")}>
+          preview unavailable
+        </div>
+      )}
+      <a href={full} target="_blank" rel="noreferrer" className="text-xs text-blue-600 hover:underline">
+        open in new tab ↗
+      </a>
+    </div>
+  );
+}
+
+// Small UI atoms
+function Spinner({ label }) {
+  return (
+    <div className="flex items-center gap-3 text-slate-600">
+      <div className="h-5 w-5 animate-spin rounded-full border-2 border-slate-300 border-t-emerald-600" />
+      <span>{label}</span>
+    </div>
+  );
+}
+function Banner({ kind, children }) {
+  const map = {
+    error: "bg-red-50 border-red-200 text-red-700",
+    ok: "bg-emerald-50 border-emerald-200 text-emerald-700",
+    info: "bg-blue-50 border-blue-200 text-blue-700",
+  };
+  return <div className={classNames("border rounded-lg px-4 py-3 text-sm", map[kind])}>{children}</div>;
+}
+function Field({ label, children, hint }) {
+  return (
+    <label className="block">
+      <span className="text-sm font-medium text-slate-700">{label}</span>
+      {children}
+      {hint && <span className="block text-xs text-slate-400 mt-0.5">{hint}</span>}
+    </label>
+  );
+}
+const inputCls = "mt-1 w-full rounded-lg border border-slate-300 px-3 py-2 text-sm focus:border-emerald-500 focus:ring-emerald-500";
+
+// ──────────────────────────────────────────────────────────────────────────
+// Main app
+// ──────────────────────────────────────────────────────────────────────────
+function App() {
+  // settings
+  const [baseUrl, setBaseUrl] = useState("http://localhost:8000");
+  const [apiKey, setApiKey] = useState("");
+
+  // workflow state
+  const [activeStep, setActiveStep] = useState(0);
+  const [project, setProject] = useState(null);
+  const [detectors, setDetectors] = useState([]);
+  const [backbones, setBackbones] = useState([]);
+  const [clustering, setClustering] = useState(null);
+  const [chosenK, setChosenK] = useState(null);
+  const [clusters, setClusters] = useState(null);
+  const [labels, setLabels] = useState({});
+  const [results, setResults] = useState(null);
+
+  const state = project?.state || null;
+
+  // After PATCH opens a new run, reset the downstream review/label/results state
+  // and jump back to the analyze step for the fresh run.
+  const handleRerun = (patched) => {
+    setProject(patched);
+    setClustering(null);
+    setChosenK(null);
+    setClusters(null);
+    setLabels({});
+    setResults(null);
+    setActiveStep(2);
+  };
+
+  // "New" — wipe everything and go back to the start of the journey (new project).
+  const handleNew = () => {
+    setProject(null);
+    setClustering(null);
+    setChosenK(null);
+    setClusters(null);
+    setLabels({});
+    setResults(null);
+    setActiveStep(0);
+  };
+
+  const api = useCallback(async (path, opts = {}) => {
+    const url = path.startsWith("http") ? path : baseUrl.replace(/\/$/, "") + path;
+    const headers = { ...(opts.headers || {}) };
+    if (apiKey) headers["X-API-Key"] = apiKey;
+    const res = await fetch(url, { ...opts, headers });
+    if (!res.ok) {
+      let detail;
+      try { const j = await res.json(); detail = j.detail ?? JSON.stringify(j); }
+      catch { detail = res.statusText; }
+      throw new Error(typeof detail === "string" ? detail : JSON.stringify(detail));
+    }
+    if (res.status === 204) return null;
+    const ct = res.headers.get("content-type") || "";
+    return ct.includes("application/json") ? res.json() : res;
+  }, [baseUrl, apiKey]);
+
+  // lock logic
+  const stepEnabled = (id) => {
+    switch (id) {
+      case 0: return true;
+      case 1: return !!project;
+      case 2: return ["UPLOADED", "ANALYZING", "AWAITING_LABELS", "FAILED"].includes(state) && (project?.orthos?.length > 0);
+      case 3: return !!clustering && REVIEW_STATES.includes(state);
+      case 4: return !!clustering && chosenK != null && REVIEW_STATES.includes(state);
+      case 5: return FINAL_STATES.includes(state);
+      default: return false;
+    }
+  };
+
+  return (
+    <div className="min-h-screen text-slate-800">
+      <Header baseUrl={baseUrl} setBaseUrl={setBaseUrl} apiKey={apiKey} setApiKey={setApiKey} state={state} run={project?.current_run} />
+      <div className="mx-auto max-w-6xl px-4 py-6 grid grid-cols-1 md:grid-cols-[220px_1fr] gap-6">
+        <Stepper activeStep={activeStep} setActiveStep={setActiveStep} stepEnabled={stepEnabled} state={state} />
+        <main className="bg-white rounded-2xl shadow-sm border border-slate-200 p-6 min-h-[400px]">
+          {state === "FAILED" && project?.error && (
+            <div className="mb-4"><Banner kind="error"><b>Last run failed:</b> {project.error}</Banner></div>
+          )}
+          {activeStep === 0 && (
+            <StepCreate api={api} detectors={detectors} setDetectors={setDetectors}
+              backbones={backbones} setBackbones={setBackbones}
+              project={project} setProject={setProject} onDone={() => setActiveStep(1)} />
+          )}
+          {activeStep === 1 && (
+            <StepUpload api={api} project={project} setProject={setProject} onDone={() => setActiveStep(2)} />
+          )}
+          {activeStep === 2 && (
+            <StepAnalyze api={api} project={project} setProject={setProject}
+              setClustering={setClustering} setChosenK={setChosenK} onDone={() => setActiveStep(3)} />
+          )}
+          {activeStep === 3 && (
+            <StepReview api={api} baseUrl={baseUrl} apiKey={apiKey} project={project}
+              clustering={clustering} chosenK={chosenK} setChosenK={setChosenK}
+              clusters={clusters} setClusters={setClusters} onDone={() => setActiveStep(4)} />
+          )}
+          {activeStep === 4 && (
+            <StepLabel api={api} baseUrl={baseUrl} apiKey={apiKey} project={project} setProject={setProject}
+              chosenK={chosenK} clusters={clusters} labels={labels} setLabels={setLabels}
+              onDone={() => setActiveStep(5)} />
+          )}
+          {activeStep === 5 && (
+            <StepFinalize api={api} baseUrl={baseUrl} apiKey={apiKey} project={project} setProject={setProject}
+              results={results} setResults={setResults} onRerun={handleRerun} onNew={handleNew} />
+          )}
+        </main>
+      </div>
+    </div>
+  );
+}
+
+function Header({ baseUrl, setBaseUrl, apiKey, setApiKey, state, run }) {
+  return (
+    <header className="bg-white border-b border-slate-200">
+      <div className="mx-auto max-w-6xl px-4 py-3 flex flex-wrap items-center gap-4">
+        <div className="flex items-center gap-2">
+          <span className="text-2xl">🌳</span>
+          <h1 className="text-lg font-semibold">Tree-Crown Species Pipeline</h1>
+        </div>
+        <div className="flex-1" />
+        {state && <span className="text-xs px-2 py-1 rounded-full bg-slate-100 border border-slate-200">state: <b>{state}</b></span>}
+        {run != null && <span className="text-xs px-2 py-1 rounded-full bg-slate-100 border border-slate-200">run <b>{run}</b></span>}
+        <div className="flex items-end gap-2">
+          <label className="text-xs text-slate-500">
+            API Base URL
+            <input value={baseUrl} onChange={(e) => setBaseUrl(e.target.value)}
+              className="block mt-0.5 w-56 rounded border border-slate-300 px-2 py-1 text-sm" />
+          </label>
+          <label className="text-xs text-slate-500">
+            API Key (optional)
+            <input value={apiKey} onChange={(e) => setApiKey(e.target.value)} type="password"
+              className="block mt-0.5 w-40 rounded border border-slate-300 px-2 py-1 text-sm" />
+          </label>
+        </div>
+      </div>
+    </header>
+  );
+}
+
+function Stepper({ activeStep, setActiveStep, stepEnabled, state }) {
+  return (
+    <nav className="flex md:flex-col gap-2">
+      {STEPS.map((s) => {
+        const enabled = stepEnabled(s.id);
+        const active = activeStep === s.id;
+        return (
+          <button key={s.id} disabled={!enabled} onClick={() => enabled && setActiveStep(s.id)}
+            title={!enabled ? "Complete the previous step first" : ""}
+            className={classNames(
+              "text-left px-3 py-2 rounded-lg border text-sm flex items-center gap-2 transition",
+              active ? "bg-emerald-600 text-white border-emerald-600"
+                : enabled ? "bg-white border-slate-200 hover:border-emerald-400"
+                : "bg-slate-50 border-slate-100 text-slate-300 cursor-not-allowed"
+            )}>
+            <span className={classNames("h-6 w-6 shrink-0 rounded-full grid place-items-center text-xs font-semibold",
+              active ? "bg-white text-emerald-600" : enabled ? "bg-slate-100" : "bg-slate-100")}>{s.id}</span>
+            {s.label}
+          </button>
+        );
+      })}
+    </nav>
+  );
+}
+
+// ── Step 0: create ──────────────────────────────────────────────────────────
+function StepCreate({ api, detectors, setDetectors, backbones, setBackbones, project, setProject, onDone }) {
+  const [name, setName] = useState("");
+  const [modelKey, setModelKey] = useState("");
+  const [backbone, setBackbone] = useState("");
+  const [epsg, setEpsg] = useState("");
+  const [params, setParams] = useState({
+    tile_size: 10, buffer: 10, iou_threshold: 0.9, conf_threshold: 0.85,
+    k_list: "2,4,6,8,10", pca_components: 50, batch_size: 16, img_size: 224,
+  });
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const [d, b] = await Promise.all([api("/api/v1/detectors"), api("/api/v1/feature-extractors")]);
+        setDetectors(d); setBackbones(b);
+        const dd = d.find((x) => x.default) || d[0];
+        const bb = b.find((x) => x.default) || b[0];
+        if (dd && !modelKey) setModelKey(dd.key);
+        if (bb && !backbone) { setBackbone(bb.name); if (bb.img_size) setParams((p) => ({ ...p, img_size: bb.img_size })); }
+      } catch (e) { setErr(e.message); }
+    })();
+  }, [api]);
+
+  const setP = (k, v) => setParams((p) => ({ ...p, [k]: v }));
+
+  const submit = async () => {
+    setErr(null); setLoading(true);
+    try {
+      const k_list = String(params.k_list).split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n));
+      const body = {
+        name, model_key: modelKey || null,
+        source_epsg: epsg === "" ? null : parseInt(epsg, 10),
+        params: {
+          tile_size: +params.tile_size, buffer: +params.buffer,
+          iou_threshold: +params.iou_threshold, conf_threshold: +params.conf_threshold,
+          k_list, pca_components: +params.pca_components, batch_size: +params.batch_size,
+          img_size: +params.img_size, model_name: backbone,
+        },
+      };
+      const p = await api("/api/v1/projects", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+      });
+      setProject(p);
+      onDone();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <h2 className="text-xl font-semibold">Step 0 — Create project</h2>
+      {err && <Banner kind="error">{err}</Banner>}
+      {project && <Banner kind="ok">Project created: <code>{project.project_id}</code>. You can re-create to start over.</Banner>}
+
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+        <Field label="Project name">
+          <input className={inputCls} value={name} onChange={(e) => setName(e.target.value)} placeholder="My survey" />
+        </Field>
+        <Field label="Source EPSG" hint="Leave blank to auto-detect from the GeoTIFF">
+          <input className={inputCls} value={epsg} onChange={(e) => setEpsg(e.target.value)} placeholder="32643" />
+        </Field>
+        <Field label="Detector model">
+          <select className={inputCls} value={modelKey} onChange={(e) => setModelKey(e.target.value)}>
+            {detectors.map((d) => (
+              <option key={d.key} value={d.key} disabled={!d.available}>
+                {(d.description || d.key)}{d.default ? " (default)" : ""}{!d.available ? " — unavailable" : ""}
+              </option>
+            ))}
+          </select>
+        </Field>
+        <Field label="Feature extractor (DINOv2)">
+          <select className={inputCls} value={backbone} onChange={(e) => {
+            setBackbone(e.target.value);
+            const bb = backbones.find((x) => x.name === e.target.value);
+            if (bb?.img_size) setP("img_size", bb.img_size);
+          }}>
+            {backbones.map((b) => (
+              <option key={b.name} value={b.name}>{(b.description || b.name)}{b.default ? " (default)" : ""}</option>
+            ))}
+          </select>
+        </Field>
+      </div>
+
+      {backbone && (
+        <details open className="rounded-lg border border-slate-200 p-4">
+          <summary className="cursor-pointer font-medium text-slate-700">Parameters</summary>
+          <div className="grid grid-cols-2 md:grid-cols-4 gap-4 mt-4">
+            <Field label="tile_size"><input className={inputCls} type="number" value={params.tile_size} onChange={(e) => setP("tile_size", e.target.value)} /></Field>
+            <Field label="buffer"><input className={inputCls} type="number" value={params.buffer} onChange={(e) => setP("buffer", e.target.value)} /></Field>
+            <Field label="iou_threshold"><input className={inputCls} type="number" step="0.01" value={params.iou_threshold} onChange={(e) => setP("iou_threshold", e.target.value)} /></Field>
+            <Field label="conf_threshold"><input className={inputCls} type="number" step="0.01" value={params.conf_threshold} onChange={(e) => setP("conf_threshold", e.target.value)} /></Field>
+            <Field label="pca_components"><input className={inputCls} type="number" value={params.pca_components} onChange={(e) => setP("pca_components", e.target.value)} /></Field>
+            <Field label="batch_size"><input className={inputCls} type="number" value={params.batch_size} onChange={(e) => setP("batch_size", e.target.value)} /></Field>
+            <Field label="img_size"><input className={inputCls} type="number" value={params.img_size} onChange={(e) => setP("img_size", e.target.value)} /></Field>
+            <Field label="k_list" hint="comma-separated"><input className={inputCls} value={params.k_list} onChange={(e) => setP("k_list", e.target.value)} /></Field>
+          </div>
+        </details>
+      )}
+
+      <div className="flex items-center gap-4">
+        <button onClick={submit} disabled={loading}
+          className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">
+          {loading ? "Creating…" : "Create project"}
+        </button>
+        {loading && <Spinner label="Creating project…" />}
+      </div>
+    </div>
+  );
+}
+
+// ── Step 1: upload ────────────────────────────────────────────────────────
+function StepUpload({ api, project, setProject, onDone }) {
+  const [tab, setTab] = useState("file");
+  const [file, setFile] = useState(null);
+  const [url, setUrl] = useState("");
+  const [gt, setGt] = useState(null);
+  const [gtMsg, setGtMsg] = useState(null);
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const uploadFile = async () => {
+    if (!file) return;
+    setErr(null); setLoading(true);
+    try {
+      const fd = new FormData(); fd.append("file", file);
+      const p = await api(`/api/v1/projects/${project.project_id}/orthomosaic`, { method: "POST", body: fd });
+      setProject(p);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+  const uploadUrl = async () => {
+    setErr(null); setLoading(true);
+    try {
+      const p = await api(`/api/v1/projects/${project.project_id}/orthomosaic/from-url`, {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ url }),
+      });
+      setProject(p);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+  const uploadGt = async () => {
+    if (!gt) return;
+    setErr(null); setGtMsg(null); setLoading(true);
+    try {
+      const fd = new FormData(); fd.append("file", gt);
+      const r = await api(`/api/v1/projects/${project.project_id}/ground-truth`, { method: "POST", body: fd });
+      setGtMsg(`Ground truth species folders: ${(r.species_folders || []).join(", ") || "(none found)"}`);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  const ortho = project?.orthos?.[0];
+
+  return (
+    <div className="space-y-5">
+      <h2 className="text-xl font-semibold">Step 1 — Upload orthomosaic</h2>
+      {err && <Banner kind="error">{err}</Banner>}
+
+      <div className="flex gap-2">
+        <button onClick={() => setTab("file")} className={classNames("px-3 py-1.5 rounded-lg text-sm border", tab === "file" ? "bg-emerald-600 text-white border-emerald-600" : "border-slate-200")}>File upload</button>
+        <button onClick={() => setTab("url")} className={classNames("px-3 py-1.5 rounded-lg text-sm border", tab === "url" ? "bg-emerald-600 text-white border-emerald-600" : "border-slate-200")}>Google Drive URL</button>
+      </div>
+
+      {tab === "file" ? (
+        <div className="space-y-3">
+          <input type="file" accept=".tif,.tiff" onChange={(e) => setFile(e.target.files[0])} className="block text-sm" />
+          <button onClick={uploadFile} disabled={loading || !file} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">Upload GeoTIFF</button>
+        </div>
+      ) : (
+        <div className="space-y-3">
+          <input className={inputCls} placeholder="https://drive.google.com/file/d/.../view" value={url} onChange={(e) => setUrl(e.target.value)} />
+          <p className="text-xs text-slate-400">Must be a public 'anyone with the link' Drive file. This downloads server-side and may take a while for large orthos.</p>
+          <button onClick={uploadUrl} disabled={loading || !url} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">Fetch from Drive</button>
+        </div>
+      )}
+
+      {loading && <Spinner label="Uploading…" />}
+
+      {ortho && (
+        <Banner kind="ok">
+          <b>{ortho.filename}</b> registered — {ortho.width}×{ortho.height}px, {ortho.bands} bands, CRS {ortho.crs || "n/a"}.
+        </Banner>
+      )}
+
+      <details className="rounded-lg border border-slate-200 p-4">
+        <summary className="cursor-pointer font-medium text-slate-700">Advanced: ground truth (optional)</summary>
+        <p className="text-xs text-slate-400 my-2">A .zip whose top-level folders are species names containing crown .tif files. Enables validation accuracy + confusion matrix at finalize.</p>
+        <input type="file" accept=".zip" onChange={(e) => setGt(e.target.files[0])} className="block text-sm" />
+        <button onClick={uploadGt} disabled={loading || !gt} className="mt-2 bg-slate-700 hover:bg-slate-800 disabled:opacity-50 text-white px-4 py-2 rounded-lg text-sm">Upload ground truth</button>
+        {gtMsg && <p className="text-xs text-emerald-700 mt-2">{gtMsg}</p>}
+      </details>
+
+      {ortho && (
+        <button onClick={onDone} className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-lg font-medium">Continue to analysis →</button>
+      )}
+    </div>
+  );
+}
+
+// ── Step 2: analyze ─────────────────────────────────────────────────────────
+function StepAnalyze({ api, project, setProject, setClustering, setChosenK, onDone }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [stateMsg, setStateMsg] = useState(null);
+
+  const run = async () => {
+    setErr(null); setLoading(true); setStateMsg(null);
+    try {
+      await assertNotBusy(api, project.project_id);   // guard: no overlapping run
+      // Fire the trigger (Airflow DAG or local background thread) and return fast.
+      const t = await api(`/api/v1/projects/${project.project_id}/runs/analyze`, { method: "POST" });
+      setStateMsg(t.state);
+      // Poll project state until the human gate is reached.
+      await pollProjectState(api, project.project_id, ["AWAITING_LABELS"], ["FAILED"], setStateMsg);
+      // Fetch the review payload now that clustering is ready.
+      const payload = await api(`/api/v1/projects/${project.project_id}/clustering`);
+      setClustering(payload);
+      setChosenK(payload.recommended_k ?? (payload.available_k || [])[0] ?? null);
+      const p = await api(`/api/v1/projects/${project.project_id}`);
+      setProject(p);
+      onDone();
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="space-y-5">
+      <h2 className="text-xl font-semibold">Step 2 — Analyze (detection + clustering)</h2>
+      <p className="text-sm text-slate-500">Triggers crown detection and feature clustering (Airflow DAG, or a local background run). The page polls progress and can take several minutes — keep this tab open.</p>
+      {err && <Banner kind="error">{err}</Banner>}
+      <button onClick={run} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">
+        {loading ? "Running…" : "Run analysis"}
+      </button>
+      {loading && (
+        <div className="rounded-lg bg-amber-50 border border-amber-200 p-4">
+          <Spinner label={`Detecting crowns and extracting features…${stateMsg ? ` (state: ${stateMsg})` : ""}`} />
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── Step 3: review ──────────────────────────────────────────────────────────
+function StepReview({ api, baseUrl, apiKey, project, clustering, chosenK, setChosenK, clusters, setClusters, onDone }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+
+  const perK = (clustering?.per_k || []).find((x) => x.k === chosenK);
+
+  useEffect(() => {
+    if (chosenK == null || !perK) return;
+    setErr(null); setLoading(true); setClusters(null);
+    api(perK.clusters_url + "?samples=8")
+      .then((c) => setClusters(c))
+      .catch((e) => setErr(e.message))
+      .finally(() => setLoading(false));
+  }, [chosenK]);
+
+  if (!clustering) return <Banner kind="info">Run the analysis first.</Banner>;
+
+  return (
+    <div className="space-y-6">
+      <h2 className="text-xl font-semibold">Step 3 — Review clusters</h2>
+
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div>
+          <h3 className="font-medium mb-2">Detection overlay</h3>
+          <AuthImage src={clustering.detection_overlay_url} baseUrl={baseUrl} apiKey={apiKey} className="rounded-lg border border-slate-200 max-h-72 object-contain" />
+        </div>
+        <div>
+          <h3 className="font-medium mb-2">k-selection metrics</h3>
+          <AuthImage src={clustering.k_selection_plot_url} baseUrl={baseUrl} apiKey={apiKey} className="rounded-lg border border-slate-200 max-h-72 object-contain" />
+        </div>
+      </div>
+
+      {clustering.k_recommendation_table?.length > 0 && (
+        <div>
+          <h3 className="font-medium mb-2">k recommendation table</h3>
+          <div className="overflow-x-auto rounded-lg border border-slate-200">
+            <table className="min-w-full text-sm">
+              <thead className="bg-slate-50">
+                <tr>{Object.keys(clustering.k_recommendation_table[0]).map((h) => <th key={h} className="px-3 py-2 text-left font-medium">{h}</th>)}</tr>
+              </thead>
+              <tbody>
+                {clustering.k_recommendation_table.map((row, i) => {
+                  const isRec = String(row.k) === String(clustering.recommended_k);
+                  return (
+                    <tr key={i} className={isRec ? "bg-emerald-50" : ""}>
+                      {Object.values(row).map((v, j) => <td key={j} className="px-3 py-1.5 border-t border-slate-100">{String(v)}</td>)}
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        </div>
+      )}
+
+      <div className="flex items-center gap-3">
+        <span className="font-medium">Choose k:</span>
+        <select className="rounded-lg border border-slate-300 px-3 py-2 text-sm" value={chosenK ?? ""} onChange={(e) => setChosenK(parseInt(e.target.value, 10))}>
+          {(clustering.available_k || []).map((k) => <option key={k} value={k}>{k}{k === clustering.recommended_k ? " (recommended)" : ""}</option>)}
+        </select>
+      </div>
+
+      {perK && (
+        <div>
+          <h3 className="font-medium mb-2">t-SNE for k={chosenK}</h3>
+          <AuthImage src={perK.tsne_plot_url} baseUrl={baseUrl} apiKey={apiKey} className="rounded-lg border border-slate-200 max-h-80 object-contain" />
+        </div>
+      )}
+
+      {err && <Banner kind="error">{err}</Banner>}
+      {loading && <Spinner label="Loading clusters…" />}
+
+      {clusters && (
+        <div className="space-y-3">
+          <h3 className="font-medium">Clusters (sample crowns)</h3>
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+            {clusters.clusters.map((c) => (
+              <div key={c.cluster} className="rounded-lg border border-slate-200 p-3">
+                <div className="text-sm font-medium mb-2">Cluster {c.cluster} · {c.count} crowns</div>
+                <div className="flex flex-wrap gap-2">
+                  {c.sample_crowns.map((u, i) => (
+                    <AuthImage key={i} src={u} baseUrl={baseUrl} apiKey={apiKey} className="h-16 w-16 object-cover rounded border border-slate-200" />
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {clusters && (
+        <button onClick={onDone} className="bg-blue-600 hover:bg-blue-700 text-white px-5 py-2.5 rounded-lg font-medium">Continue to labeling →</button>
+      )}
+    </div>
+  );
+}
+
+// ── Step 4: label ───────────────────────────────────────────────────────────
+function StepLabel({ api, baseUrl, apiKey, project, setProject, chosenK, clusters, labels, setLabels, onDone }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [result, setResult] = useState(null);
+
+  const setLabel = (cid, key, val) => setLabels((m) => ({ ...m, [cid]: { ...(m[cid] || {}), [key]: val } }));
+  const thumbFor = (cid) => clusters?.clusters?.find((c) => c.cluster === cid)?.sample_crowns?.[0];
+
+  const submit = async () => {
+    setErr(null); setLoading(true); setResult(null);
+    try {
+      const csv = buildLabelsCsv(chosenK, labels);
+      const fd = new FormData();
+      fd.append("chosen_k", String(chosenK));
+      fd.append("file", new Blob([csv], { type: "text/csv" }), "labels.csv");
+      const r = await api(`/api/v1/projects/${project.project_id}/labels`, { method: "POST", body: fd });
+      setResult(r);
+      const p = await api(`/api/v1/projects/${project.project_id}`);
+      setProject(p);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  if (chosenK == null) return <Banner kind="info">Pick a k in the Review step first.</Banner>;
+
+  return (
+    <div className="space-y-5">
+      <h2 className="text-xl font-semibold">Step 4 — Label species (k = {chosenK})</h2>
+      <p className="text-sm text-slate-500">Name each cluster. Blank species are stored as <code>unlabelled</code>. Names are normalized server-side (lowercase, spaces/hyphens → underscore).</p>
+      {err && <Banner kind="error">{err}</Banner>}
+
+      <div className="overflow-x-auto rounded-lg border border-slate-200">
+        <table className="min-w-full text-sm">
+          <thead className="bg-slate-50">
+            <tr>
+              <th className="px-3 py-2 text-left font-medium w-20">Cluster</th>
+              <th className="px-3 py-2 text-left font-medium w-24">Sample</th>
+              <th className="px-3 py-2 text-left font-medium">Species</th>
+              <th className="px-3 py-2 text-left font-medium">Notes</th>
+            </tr>
+          </thead>
+          <tbody>
+            {Array.from({ length: chosenK }, (_, cid) => (
+              <tr key={cid} className="border-t border-slate-100">
+                <td className="px-3 py-2 font-medium">{cid}</td>
+                <td className="px-3 py-2">
+                  {thumbFor(cid) ? <AuthImage src={thumbFor(cid)} baseUrl={baseUrl} apiKey={apiKey} className="h-12 w-12 object-cover rounded border border-slate-200" /> : <span className="text-slate-300 text-xs">—</span>}
+                </td>
+                <td className="px-3 py-2">
+                  <input className="w-full rounded border border-slate-300 px-2 py-1" placeholder="e.g. oak"
+                    value={labels[cid]?.species || ""} onChange={(e) => setLabel(cid, "species", e.target.value)} />
+                </td>
+                <td className="px-3 py-2">
+                  <input className="w-full rounded border border-slate-300 px-2 py-1" placeholder="optional"
+                    value={labels[cid]?.notes || ""} onChange={(e) => setLabel(cid, "notes", e.target.value)} />
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+
+      <div className="flex items-center gap-4">
+        <button onClick={submit} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">
+          {loading ? "Submitting…" : "Submit labels"}
+        </button>
+        {loading && <Spinner label="Submitting labels…" />}
+      </div>
+
+      {result && (
+        <Banner kind="ok">
+          Labels saved (state {result.state}). Species counts: {Object.entries(result.species_counts_preview || {}).map(([k, v]) => `${k}×${v}`).join(", ")}.
+          <div className="mt-2"><button onClick={onDone} className="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-lg text-sm">Continue to finalize →</button></div>
+        </Banner>
+      )}
+    </div>
+  );
+}
+
+// Adjust parameters and open a new run on the same ortho (PATCH /projects/{id}).
+function RerunPanel({ api, project, onRerun }) {
+  const cur = project.params || {};
+  const [p, setP] = useState({
+    tile_size: cur.tile_size ?? 10,
+    buffer: cur.buffer ?? 10,
+    iou_threshold: cur.iou_threshold ?? 0.9,
+    conf_threshold: cur.conf_threshold ?? 0.85,
+    k_list: Array.isArray(cur.k_list) ? cur.k_list.join(",") : (cur.k_list ?? "2,4,6,8,10"),
+    pca_components: cur.pca_components ?? 50,
+    batch_size: cur.batch_size ?? 16,
+    img_size: cur.img_size ?? 224,
+  });
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const set = (k, v) => setP((s) => ({ ...s, [k]: v }));
+
+  const submit = async () => {
+    setErr(null); setLoading(true);
+    try {
+      await assertNotBusy(api, project.project_id);   // guard: no overlapping run
+      const params = {
+        tile_size: +p.tile_size, buffer: +p.buffer, iou_threshold: +p.iou_threshold,
+        conf_threshold: +p.conf_threshold,
+        k_list: String(p.k_list).split(",").map((s) => parseInt(s.trim(), 10)).filter((n) => !isNaN(n)),
+        pca_components: +p.pca_components, batch_size: +p.batch_size, img_size: +p.img_size,
+      };
+      const patched = await api(`/api/v1/projects/${project.project_id}`, {
+        method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ params }),
+      });
+      onRerun(patched);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  return (
+    <div className="rounded-lg border border-slate-200 p-4 space-y-4">
+      <p className="text-xs text-slate-400">Tweak parameters and start a fresh run on the same orthomosaic. The previous run is kept on disk; the new one computes from scratch and you'll re-label its clusters.</p>
+      {err && <Banner kind="error">{err}</Banner>}
+      <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+        <Field label="tile_size"><input className={inputCls} type="number" value={p.tile_size} onChange={(e) => set("tile_size", e.target.value)} /></Field>
+        <Field label="buffer"><input className={inputCls} type="number" value={p.buffer} onChange={(e) => set("buffer", e.target.value)} /></Field>
+        <Field label="iou_threshold"><input className={inputCls} type="number" step="0.01" value={p.iou_threshold} onChange={(e) => set("iou_threshold", e.target.value)} /></Field>
+        <Field label="conf_threshold"><input className={inputCls} type="number" step="0.01" value={p.conf_threshold} onChange={(e) => set("conf_threshold", e.target.value)} /></Field>
+        <Field label="pca_components"><input className={inputCls} type="number" value={p.pca_components} onChange={(e) => set("pca_components", e.target.value)} /></Field>
+        <Field label="batch_size"><input className={inputCls} type="number" value={p.batch_size} onChange={(e) => set("batch_size", e.target.value)} /></Field>
+        <Field label="img_size"><input className={inputCls} type="number" value={p.img_size} onChange={(e) => set("img_size", e.target.value)} /></Field>
+        <Field label="k_list" hint="comma-separated"><input className={inputCls} value={p.k_list} onChange={(e) => set("k_list", e.target.value)} /></Field>
+      </div>
+      <button onClick={submit} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">
+        {loading ? "Starting new run…" : "Save & start new run"}
+      </button>
+    </div>
+  );
+}
+
+// ── Step 5: finalize ──────────────────────────────────────────────────────
+function StepFinalize({ api, baseUrl, apiKey, project, setProject, results, setResults, onRerun, onNew }) {
+  const [loading, setLoading] = useState(false);
+  const [err, setErr] = useState(null);
+  const [stateMsg, setStateMsg] = useState(null);
+  const [showRerun, setShowRerun] = useState(false);
+  const abs = (p) => (p ? (p.startsWith("http") ? p : baseUrl.replace(/\/$/, "") + p) : null);
+
+  const run = async () => {
+    setErr(null); setLoading(true); setStateMsg(null);
+    try {
+      await assertNotBusy(api, project.project_id);   // guard: no overlapping run
+      const t = await api(`/api/v1/projects/${project.project_id}/runs/finalize`, { method: "POST" });
+      setStateMsg(t.state);
+      await pollProjectState(api, project.project_id, ["COMPLETED"], ["FAILED"], setStateMsg);
+      const r = await api(`/api/v1/projects/${project.project_id}/results`);
+      setResults(r);
+      const p = await api(`/api/v1/projects/${project.project_id}`);
+      setProject(p);
+    } catch (e) { setErr(e.message); } finally { setLoading(false); }
+  };
+
+  const d = results?.downloads || {};
+  const dist = results?.species_distribution || {};
+  const maxV = Math.max(1, ...Object.values(dist));
+
+  return (
+    <div className="space-y-5">
+      <h2 className="text-xl font-semibold">Step 5 — Finalize & results</h2>
+      <p className="text-sm text-slate-500">Triggers species assignment, validation against ground truth (if uploaded), and KMZ + CSV export, then polls until done.</p>
+      {err && <Banner kind="error">{err}</Banner>}
+
+      <button onClick={run} disabled={loading} className="bg-emerald-600 hover:bg-emerald-700 disabled:opacity-50 text-white px-5 py-2.5 rounded-lg font-medium">
+        {loading ? "Finalizing…" : (results ? "Re-run finalize" : "Finalize & export")}
+      </button>
+      {loading && <div className="rounded-lg bg-amber-50 border border-amber-200 p-4"><Spinner label={`Assigning species and exporting…${stateMsg ? ` (state: ${stateMsg})` : ""}`} /></div>}
+
+      {results && (
+        <div className="space-y-6">
+          <div>
+            <h3 className="font-medium mb-2">Species distribution</h3>
+            <div className="space-y-1">
+              {Object.entries(dist).map(([sp, n]) => (
+                <div key={sp} className="flex items-center gap-2 text-sm">
+                  <span className="w-32 truncate">{sp}</span>
+                  <div className="flex-1 bg-slate-100 rounded h-4"><div className="bg-emerald-500 h-4 rounded" style={{ width: `${(n / maxV) * 100}%` }} /></div>
+                  <span className="w-10 text-right">{n}</span>
+                </div>
+              ))}
+            </div>
+          </div>
+
+          {results.validation && (
+            <Banner kind="info">Validation: {results.validation.matched_samples} matched samples, accuracy {(results.validation.accuracy * 100).toFixed(1)}%.</Banner>
+          )}
+
+          <div>
+            <h3 className="font-medium mb-2">Downloads</h3>
+            <div className="flex flex-wrap gap-3">
+              {d.kmz && <a href={abs(d.kmz)} target="_blank" rel="noreferrer" className="bg-emerald-600 hover:bg-emerald-700 text-white px-4 py-2 rounded-lg text-sm">⬇ KMZ (Google Earth)</a>}
+              {d.crown_master_csv && <a href={abs(d.crown_master_csv)} target="_blank" rel="noreferrer" className="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-lg text-sm">⬇ crown_master.csv</a>}
+              {d.polygon_species_csv && <a href={abs(d.polygon_species_csv)} target="_blank" rel="noreferrer" className="bg-slate-700 hover:bg-slate-800 text-white px-4 py-2 rounded-lg text-sm">⬇ polygon_species.csv</a>}
+              {!d.kmz && !d.crown_master_csv && <span className="text-sm text-slate-400">No downloads available.</span>}
+            </div>
+          </div>
+
+          {d.confusion_matrix_png && (
+            <div>
+              <h3 className="font-medium mb-2">Confusion matrix</h3>
+              <AuthImage src={d.confusion_matrix_png} baseUrl={baseUrl} apiKey={apiKey} className="rounded-lg border border-slate-200 max-h-80 object-contain" />
+            </div>
+          )}
+
+          <div className="border-t border-slate-200 pt-4 space-y-3">
+            <div className="flex flex-wrap gap-3">
+              <button onClick={onNew} className="bg-slate-700 hover:bg-slate-800 text-white px-5 py-2.5 rounded-lg font-medium">+ New</button>
+              <button onClick={() => setShowRerun((s) => !s)} className="border border-emerald-600 text-emerald-700 hover:bg-emerald-50 px-5 py-2.5 rounded-lg font-medium">
+                {showRerun ? "Cancel reanalyze" : "Reanalyze"}
+              </button>
+            </div>
+            <p className="text-xs text-slate-400"><b>New</b> starts a fresh project from scratch. <b>Reanalyze</b> edits parameters and recomputes on the same orthomosaic as a new run.</p>
+            {showRerun && <RerunPanel api={api} project={project} onRerun={onRerun} />}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

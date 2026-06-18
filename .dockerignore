@@ -1,0 +1,29 @@
+# ── version control / python caches ──────────────────────────────────
+.git
+.gitignore
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+
+# ── local virtualenv (image installs its own) ────────────────────────
+venv/
+.venv/
+
+# ── large data: weights & orthos are MOUNTED, never baked into image ──
+*.pth
+*.zip
+ortho/
+storage/
+
+# ── runtime artifacts / local DB ──────────────────────────────────────
+treecrown.db
+*.log
+
+# ── docs / build scratch not needed at runtime ───────────────────────
+*.docx
+*.pptx
+outputs/
+build_detectron.log
+
+# ── env files (provide at runtime, don't bake secrets) ────────────────
+.env

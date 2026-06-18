@@ -1,0 +1,82 @@
+# ════════════════════════════════════════════════════════════════════════
+# Tree-Crown Species Pipeline — local / single-host deployment
+#
+#   redis   - broker + result backend + cleanup lock
+#   api     - FastAPI (uploads, project lifecycle, review/results JSON)
+#   worker  - Celery worker: analyze + cluster (DAG 1) AND finalize/KMZ (DAG 2)
+#   beat    - Celery Beat: nightly retention cleanup
+#
+# Storage and the model catalog are MOUNTED, never baked into the image.
+# ════════════════════════════════════════════════════════════════════════
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: .
+    image: treecrown-pipeline:latest
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - app-data:/data                # per-project input/output + sqlite DB
+      - ./models:/models:ro           # detector .pth weights + models.yaml
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/livez"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  worker:
+    image: treecrown-pipeline:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    # One worker drains both queues: gpu = detection + DINOv2 features,
+    # cpu = crop/cluster/t-SNE + assign/validate/KMZ export + cleanup.
+    # prefork is required (detection uses os.chdir for CWD isolation).
+    command: >
+      celery -A app.workers.celery_app:celery_app worker
+      -Q gpu,cpu --concurrency=2 --pool=prefork --loglevel=info
+    volumes:
+      - app-data:/data
+      - ./models:/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+    # For GPU: install a CUDA image (see DOCKER.md) and uncomment:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - { driver: nvidia, count: all, capabilities: [gpu] }
+
+  beat:
+    image: treecrown-pipeline:latest
+    build: .
+    restart: unless-stopped
+    env_file: .env
+    command: >
+      celery -A app.workers.celery_app:celery_app beat --loglevel=info
+    volumes:
+      - app-data:/data                # needs storage + DB to delete expired projects
+      - ./models:/models:ro
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:
+  app-data:
